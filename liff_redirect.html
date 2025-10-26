@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>LINE Login Redirect</title>
+    <script src="https://static.line-scdn.net/liff/edge/2.1/sdk.js"></script>
+    <script>
+      async function main() {
+        try {
+          // ✅ ใส่ LIFF ID ของคุณตรงนี้
+          await liff.init({ liffId: "2005917411-xXRzVK7Q" });
+
+          // ถ้ายังไม่ล็อกอิน LINE → ให้ล็อกอินก่อน
+          if (!liff.isLoggedIn()) {
+            liff.login();
+            return;
+          }
+
+          // ✅ ดึง idToken
+          const idToken = liff.getIDToken();
+
+          // ✅ ใส่ URL ของ Flutter Web (Firebase Hosting)
+          const redirectUrl = "https://your-flutter-app.web.app?idToken=" + idToken;
+
+          // เปลี่ยนหน้าไป Flutter พร้อมส่ง idToken ไปด้วย
+          window.location.href = redirectUrl;
+        } catch (e) {
+          document.body.innerHTML = `<h3>เกิดข้อผิดพลาด: ${e.message}</h3>`;
+        }
+      }
+
+      main();
+    </script>
+  </head>
+  <body>
+    <p>กำลังเข้าสู่ระบบผ่าน LINE...</p>
+  </body>
+</html>
