@@ -4,15 +4,18 @@ import cors from "cors";
 import fetch from "node-fetch";
 import admin from "firebase-admin";
 import dotenv from "dotenv";
-import serviceAccount from "./serviceAccountKey.json" assert { type: "json" };
+import fs from "fs";
 
 dotenv.config();
+
+const serviceAccount = JSON.parse(fs.readFileSync("./serviceAccountKey.json", "utf8"));
 
 const app = express();
 const port = process.env.PORT || 10000;
 
 app.use(cors());
 app.use(bodyParser.json());
+
 
 // --------------------------------------------
 // LINE Login Route
