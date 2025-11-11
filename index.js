@@ -8,7 +8,8 @@ import fs from "fs";
 
 dotenv.config();
 
-const serviceAccount = JSON.parse(fs.readFileSync("./serviceAccountKey.json", "utf8"));
+const serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
+
 
 const app = express();
 const port = process.env.PORT || 10000;
