@@ -99,21 +99,44 @@ app.get("/callback", async (req, res) => {
     const profile = await profileResp.json();
     console.log("✅ LINE Profile:", profile);
 
-    /* ---------- สร้าง Firebase Custom Token ---------- */
-    const uid = `line:${profile.userId}`;
-    const firebaseToken = await admin.auth().createCustomToken(uid);
+    /* ---------- สร้าง Firebase User + Custom Token ---------- */
 
+// 🔥 1. เอา LINE userId
+const lineUserId = profile.userId;
+
+// 🔥 2. สร้าง email ปลอม
+const fakeEmail = lineUserId + "@line.com";
+
+let user;
+
+try {
+  // 🔥 3. หา user เดิม
+  user = await admin.auth().getUserByEmail(fakeEmail);
+} catch (e) {
+  // 🔥 4. ถ้าไม่มี → สร้างใหม่
+  user = await admin.auth().createUser({
+    email: fakeEmail,
+    password: "12345678",
+  });
+}
+
+// 🔥 5. ได้ Firebase UID จริง
+const firebaseUid = user.uid;
+
+// 🔥 6. สร้าง token
+const firebaseToken = await admin.auth().createCustomToken(firebaseUid);
     /* ---------- บันทึก user ลง Firestore (optional แต่แนะนำ) ---------- */
-    await admin.firestore().collection("users").doc(uid).set(
-      {
-        uid,
-        lineUserId: profile.userId,
-        displayName: profile.displayName || null,
-        pictureUrl: profile.pictureUrl || null,
-        lastLogin: admin.firestore.FieldValue.serverTimestamp(),
-      },
-      { merge: true }
-    );
+    await admin.firestore().collection("users").doc(firebaseUid).set(
+  {
+    uid: firebaseUid,
+    lineUserId: profile.userId,
+    displayName: profile.displayName || null,
+    pictureUrl: profile.pictureUrl || null,
+    lastLogin: admin.firestore.FieldValue.serverTimestamp(),
+  },
+  { merge: true }
+  );
+  console.log("🔥 Firebase UID:", firebaseUid);
 
     /* ---------- Redirect กลับ Flutter Web ---------- */
     const frontend =
