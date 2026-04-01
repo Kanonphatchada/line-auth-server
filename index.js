@@ -7,11 +7,9 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
-/* =====================================================
-   Firebase Admin (ต้อง init ก่อนใช้ admin.auth())
-===================================================== */
+/* ================= Firebase Admin ================= */
 if (!process.env.FIREBASE_KEY) {
-  throw new Error("❌ FIREBASE_KEY is not set in environment variables");
+  throw new Error("❌ FIREBASE_KEY is not set");
 }
 
 const serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
@@ -20,27 +18,21 @@ admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
 
-/* =====================================================
-   Express App
-===================================================== */
+/* ================= Express ================= */
 const app = express();
 const port = process.env.PORT || 10000;
 
 app.use(cors());
 app.use(bodyParser.json());
 
-/* =====================================================
-   LINE Login Route
-===================================================== */
+/* ================= LOGIN ================= */
 app.get("/login", (req, res) => {
-  const clientId = process.env.LINE_CLIENT_ID || "2005917411";
-  const redirectUri =
-    process.env.LINE_CALLBACK_URL ||
-    "https://line-auth-server.onrender.com/callback";
+  const clientId = process.env.LINE_CLIENT_ID;
+  const redirectUri = process.env.LINE_CALLBACK_URL;
 
   const state = "state_" + Date.now();
 
-  const loginUrl =
+  const url =
     `https://access.line.me/oauth2/v2.1/authorize` +
     `?response_type=code` +
     `&client_id=${clientId}` +
@@ -48,48 +40,33 @@ app.get("/login", (req, res) => {
     `&state=${state}` +
     `&scope=profile%20openid%20email`;
 
-  return res.redirect(loginUrl);
+  res.redirect(url);
 });
 
-/* =====================================================
-   LINE Callback Route
-===================================================== */
+/* ================= CALLBACK ================= */
 app.get("/callback", async (req, res) => {
   const code = req.query.code;
 
   if (!code) {
-    return res.status(400).send("❌ Missing authorization code");
+    return res.status(400).send("❌ No code");
   }
-
-  const tokenUrl = "https://api.line.me/oauth2/v2.1/token";
-  const clientId = process.env.LINE_CLIENT_ID;
-  const clientSecret = process.env.LINE_CLIENT_SECRET;
-  const redirectUri = process.env.LINE_CALLBACK_URL;
-
   try {
-    /* ---------- แลก code เป็น access_token ---------- */
-    const tokenResp = await fetch(tokenUrl, {
+    /* ---------- 1. แลก token ---------- */
+    const tokenResp = await fetch("https://api.line.me/oauth2/v2.1/token", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
         grant_type: "authorization_code",
         code,
-        redirect_uri: redirectUri,
-        client_id: clientId,
-        client_secret: clientSecret,
+        redirect_uri: process.env.LINE_CALLBACK_URL,
+        client_id: process.env.LINE_CLIENT_ID,
+        client_secret: process.env.LINE_CLIENT_SECRET,
       }),
     });
 
     const tokenData = await tokenResp.json();
 
-    if (tokenData.error) {
-      console.error("LINE token error:", tokenData);
-      return res
-        .status(400)
-        .send("LINE token error: " + tokenData.error_description);
-    }
-
-    /* ---------- ดึง LINE profile ---------- */
+    /* ---------- 2. ดึง profile ---------- */
     const profileResp = await fetch("https://api.line.me/v2/profile", {
       headers: {
         Authorization: `Bearer ${tokenData.access_token}`,
@@ -97,69 +74,84 @@ app.get("/callback", async (req, res) => {
     });
 
     const profile = await profileResp.json();
-    console.log("✅ LINE Profile:", profile);
+    console.log("✅ LINE:", profile);
 
-    /* ---------- สร้าง Firebase User + Custom Token ---------- */
+    const lineUserId = profile.userId;
+    const fakeEmail = `${lineUserId}@line.com`;
 
-// 🔥 1. เอา LINE userId
-const lineUserId = profile.userId;
+    let user;
 
-// 🔥 2. สร้าง email ปลอม
-const fakeEmail = lineUserId + "@line.com";
+    try {
+      user = await admin.auth().getUserByEmail(fakeEmail);
+    } catch {
+      user = await admin.auth().createUser({
+        email: fakeEmail,
+        password: "12345678",
+      });
+    }
 
-let user;
+    const firebaseUid = user.uid;
 
-try {
-  // 🔥 3. หา user เดิม
-  user = await admin.auth().getUserByEmail(fakeEmail);
-} catch (e) {
-  // 🔥 4. ถ้าไม่มี → สร้างใหม่
-  user = await admin.auth().createUser({
-    email: fakeEmail,
-    password: "12345678",
-  });
-}
+    console.log("🔥 Firebase UID:", firebaseUid);
 
-// 🔥 5. ได้ Firebase UID จริง
-const firebaseUid = user.uid;
+    /* ---------- 3. สร้าง Custom Token ---------- */
+    const firebaseToken = await admin.auth().createCustomToken(firebaseUid);
 
-// 🔥 6. สร้าง token
-const firebaseToken = await admin.auth().createCustomToken(firebaseUid);
-    /* ---------- บันทึก user ลง Firestore (optional แต่แนะนำ) ---------- */
+    /* ---------- 4. Save user ---------- */
     await admin.firestore().collection("users").doc(firebaseUid).set(
-  {
-    uid: firebaseUid,
-    lineUserId: profile.userId,
-    displayName: profile.displayName || null,
-    pictureUrl: profile.pictureUrl || null,
-    lastLogin: admin.firestore.FieldValue.serverTimestamp(),
-  },
-  { merge: true }
-  );
-  console.log("🔥 Firebase UID:", firebaseUid);
+      {
+        uid: firebaseUid, // 🔥 ตัวจริง
+        lineUserId: lineUserId, // 🔥 เก็บไว้ map
+        displayName: profile.displayName || null,
+        pictureUrl: profile.pictureUrl || null,
+        lastLogin: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
 
-    /* ---------- Redirect กลับ Flutter Web ---------- */
-    const frontend =
-      process.env.FRONTEND_URL || "http://localhost:59812";
-
+    /* ---------- 5. Redirect ---------- */
     const redirectUrl =
-      `${frontend}?firebaseToken=${encodeURIComponent(firebaseToken)}` +
-      `&displayName=${encodeURIComponent(profile.displayName || "")}`;
+      `${process.env.FRONTEND_URL}?firebaseToken=${firebaseToken}`;
 
-    return res.redirect(redirectUrl);
+    res.redirect(redirectUrl);
   } catch (err) {
-    console.error("❌ Callback error:", err);
-    return res.status(500).send("Internal Server Error");
+    console.error("❌ ERROR:", err);
+    res.status(500).send("Error");
   }
 });
 
-/* =====================================================
-   Health Check
-===================================================== */
-app.get("/", (req, res) => {
-  res.send("✅ LINE Auth Server is running!");
-});
-
+/* ================= RUN ================= */
 app.listen(port, () => {
-  console.log(`🚀 Server running on port ${port}`);
+  console.log("🚀 Server running on port", port);
+})
+/* =====================================================
+   ESP32 Update Route
+===================================================== */
+app.post("/update", async (req, res) => {
+  try {
+    const { nano, Moisture, Valve, Auto, Time } = req.body;
+
+    console.log("🔥 BODY:", req.body);
+
+    if (!nano) {
+      return res.status(400).send("Missing nano id");
+    }
+
+    await admin.firestore().collection("ESP32").doc(nano).set(
+      {
+        Moisture: Moisture ?? 0,
+        Valve: Valve ?? false,
+        Auto: Auto ?? false,
+        Time: Time ?? "",
+      },
+      { merge: true }
+    );
+
+    console.log(`✅ Updated ${nano}`);
+
+    res.send("OK");
+  } catch (err) {
+    console.error("❌ ESP32 Update Error:", err);
+    res.status(500).send("Error");
+  }
 });
