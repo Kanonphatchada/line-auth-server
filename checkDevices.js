@@ -1,7 +1,45 @@
 import admin from "firebase-admin";
+import fetch from "node-fetch";
 
 // ไม่เรียก admin.initializeApp() ในไฟล์นี้ — ฟังก์ชันนี้ถูก import เข้าไปใช้
 // ใน index.js ซึ่ง initialize แอปไว้แล้วตั้งแต่ตอนเริ่มเซิร์ฟเวอร์
+
+// ส่งข้อความแจ้งเตือนไปหาเจ้าของอุปกรณ์ผ่าน LINE Messaging API — ใช้
+// lineUserId ที่เก็บไว้ตอน login แล้ว (users/{uid}.lineUserId) ไม่ต้องสร้าง
+// ระบบ map ผู้ใช้ใหม่ ถ้ายังไม่ได้ตั้ง LINE_MESSAGING_TOKEN หรือหา
+// lineUserId ไม่เจอ จะข้ามไปเงียบๆ ไม่ทำให้ checkDevices ทั้งรอบพัง
+async function sendLineAlert(uid, text) {
+  if (!process.env.LINE_MESSAGING_TOKEN) {
+    return;
+  }
+
+  try {
+    const userDoc = await admin.firestore().collection("users").doc(uid).get();
+    const lineUserId = userDoc.exists ? userDoc.data().lineUserId : null;
+
+    if (!lineUserId) {
+      return;
+    }
+
+    const res = await fetch("https://api.line.me/v2/bot/message/push", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${process.env.LINE_MESSAGING_TOKEN}`,
+      },
+      body: JSON.stringify({
+        to: lineUserId,
+        messages: [{ type: "text", text }],
+      }),
+    });
+
+    if (!res.ok) {
+      console.error("❌ LINE push failed:", res.status, await res.text());
+    }
+  } catch (err) {
+    console.error("❌ sendLineAlert error:", err);
+  }
+}
 
 // อุปกรณ์ควรรายงานค่าเข้ามาสม่ำเสมอ (ทุก 5 นาทีตามสเปกจริง) ถ้าเงียบไปนาน
 // ผิดปกติ น่าจะพัง/หลุดการเชื่อมต่อ
@@ -66,6 +104,12 @@ export async function checkDevices() {
     if (isStale && data.offline !== true) {
       updates.offline = true;
       offlineFlagged++;
+      if (data.uid) {
+        await sendLineAlert(
+          data.uid,
+          `⚠️ อุปกรณ์ "${doc.id}" ขาดการติดต่อเกิน 30 นาที ลองตรวจสอบสัญญาณ/แหล่งจ่ายไฟด้วยครับ`
+        );
+      }
     } else if (!isStale && data.offline === true) {
       updates.offline = false;
       onlineCleared++;
@@ -128,6 +172,16 @@ export async function checkDevices() {
             : admin.firestore.FieldValue.delete();
           if (faultType) {
             faultsFlagged++;
+            if (data.uid) {
+              const label =
+                faultType === "valve_stuck_open"
+                  ? "วาล์วค้างเปิด (น้ำอาจไหลไม่หยุด)"
+                  : "วาล์วอาจไม่ทำงาน (เปิดน้ำแล้วความชื้นไม่ขึ้น)";
+              await sendLineAlert(
+                data.uid,
+                `🚱 อุปกรณ์ "${doc.id}" ${label} ลองตรวจสอบวาล์ว/ท่อน้ำด้วยครับ`
+              );
+            }
           } else {
             faultsCleared++;
           }
