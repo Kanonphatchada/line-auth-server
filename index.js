@@ -4,6 +4,7 @@ import cors from "cors";
 import fetch from "node-fetch";
 import admin from "firebase-admin";
 import dotenv from "dotenv";
+import { checkDevices } from "./checkDevices.js";
 
 dotenv.config();
 
@@ -152,6 +153,24 @@ app.post("/update", async (req, res) => {
     res.send("OK");
   } catch (err) {
     console.error("❌ ESP32 Update Error:", err);
+    res.status(500).send("Error");
+  }
+});
+
+/* =====================================================
+   Device health check — เรียกโดย cron ภายนอกฟรี (เช่น cron-job.org)
+   ทุก 10-15 นาที แทนการใช้ Firebase Cloud Functions ที่ต้อง Blaze plan
+===================================================== */
+app.get("/cron/check-devices", async (req, res) => {
+  if (!process.env.CRON_SECRET || req.query.key !== process.env.CRON_SECRET) {
+    return res.status(401).send("Unauthorized");
+  }
+
+  try {
+    const summary = await checkDevices();
+    res.json({ ok: true, ...summary });
+  } catch (err) {
+    console.error("❌ checkDevices error:", err);
     res.status(500).send("Error");
   }
 });

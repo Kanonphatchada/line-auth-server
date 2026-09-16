@@ -1,19 +1,7 @@
 import admin from "firebase-admin";
-import dotenv from "dotenv";
 
-dotenv.config();
-
-if (!process.env.FIREBASE_KEY) {
-  throw new Error("❌ FIREBASE_KEY is not set");
-}
-
-if (!admin.apps.length) {
-  admin.initializeApp({
-    credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_KEY)),
-  });
-}
-
-const db = admin.firestore();
+// ไม่เรียก admin.initializeApp() ในไฟล์นี้ — ฟังก์ชันนี้ถูก import เข้าไปใช้
+// ใน index.js ซึ่ง initialize แอปไว้แล้วตั้งแต่ตอนเริ่มเซิร์ฟเวอร์
 
 // อุปกรณ์ควรรายงานค่าเข้ามาสม่ำเสมอ (ทุก 5 นาทีตามสเปกจริง) ถ้าเงียบไปนาน
 // ผิดปกติ น่าจะพัง/หลุดการเชื่อมต่อ
@@ -27,11 +15,13 @@ const MOISTURE_NOISE_FLOOR_PERCENT = 3;
 // ต้องรอให้คำสั่งวาล์วนิ่ง (ไม่เพิ่งสั่งเปลี่ยน) มานานพอจะดูแนวโน้มได้จริง
 const VALVE_STABLE_MS = 30 * 60 * 1000; // 30 นาที
 
-// สคริปต์นี้แทนที่ Cloud Functions ทั้ง 4 ตัวที่เขียนไว้ก่อนหน้า (ซึ่ง deploy
-// ไม่ได้เพราะโปรเจกต์ยังอยู่ Firebase plan ฟรี) — ทำงานแบบ "โพล" (เรียกเป็น
-// รอบๆ ผ่าน Render Cron Job) แทนแบบ trigger เรียลไทม์ ไม่ต้องใช้ Blaze plan
-// เลย เพราะรันบน Render ด้วย Admin SDK ตรงๆ เหมือนกับ /update route เดิม
-async function checkDevices() {
+// ฟังก์ชันนี้แทนที่ Cloud Functions ทั้ง 4 ตัวที่เขียนไว้ก่อนหน้า (ซึ่ง deploy
+// ไม่ได้เพราะโปรเจกต์ยังอยู่ Firebase plan ฟรี) — ทำงานแบบ "โพล" เรียกผ่าน
+// route /cron/check-devices ใน index.js โดยมี cron ภายนอกฟรียิงเข้ามาเป็น
+// รอบๆ แทนแบบ trigger เรียลไทม์ ไม่ต้องใช้ Blaze plan เลย เพราะรันบน Render
+// ด้วย Admin SDK ตรงๆ เหมือนกับ /update route เดิม
+export async function checkDevices() {
+  const db = admin.firestore();
   const now = admin.firestore.Timestamp.now();
   const snapshot = await db.collection("ESP32").get();
 
@@ -150,14 +140,16 @@ async function checkDevices() {
     }
   }
 
-  console.log(
-    `✅ checkDevices: ${snapshot.size} devices scanned | assigned=${assigned} offlineFlagged=${offlineFlagged} onlineCleared=${onlineCleared} faultsFlagged=${faultsFlagged} faultsCleared=${faultsCleared}`
-  );
-}
+  const summary = {
+    scanned: snapshot.size,
+    assigned,
+    offlineFlagged,
+    onlineCleared,
+    faultsFlagged,
+    faultsCleared,
+  };
 
-checkDevices()
-  .then(() => process.exit(0))
-  .catch((err) => {
-    console.error("❌ checkDevices failed:", err);
-    process.exit(1);
-  });
+  console.log("✅ checkDevices:", summary);
+
+  return summary;
+}
