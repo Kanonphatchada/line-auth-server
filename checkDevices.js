@@ -86,16 +86,23 @@ export async function checkDevices() {
       }
     }
 
-    // 2) เช็คว่ารายงานล่าสุดเมื่อไหร่ จาก log ล่าสุด (แทน lastSeen เดิม)
+    // 2) เช็คว่ารายงานล่าสุดเมื่อไหร่ — ดูทั้ง field lastSeen บนตัว doc เอง
+    //    (ที่ /update ประทับให้ทุกครั้งที่อุปกรณ์รายงานค่า) และ log ล่าสุดใน
+    //    Logs (เผื่อบางอุปกรณ์เขียน Firestore ตรงๆ อีกทางที่ไม่ผ่าน /update)
+    //    เอาอันที่ใหม่กว่า กันพลาดไม่ว่าอุปกรณ์จะรายงานผ่านทางไหน
+    const lastSeenFieldMs = data.lastSeen?.toMillis?.() ?? null;
+
     const lastLogSnap = await doc.ref
       .collection("Logs")
       .orderBy("timestamp", "desc")
       .limit(1)
       .get();
 
-    const lastSeenMs = lastLogSnap.empty
+    const lastLogMs = lastLogSnap.empty
       ? null
       : (lastLogSnap.docs[0].data().timestamp?.toMillis?.() ?? null);
+
+    const lastSeenMs = Math.max(lastSeenFieldMs ?? 0, lastLogMs ?? 0) || null;
 
     const isStale =
       lastSeenMs === null ||

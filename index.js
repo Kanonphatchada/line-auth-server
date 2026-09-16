@@ -144,6 +144,9 @@ app.post("/update", async (req, res) => {
         Valve: Valve ?? false,
         Auto: Auto ?? false,
         Time: Time ?? "",
+        // ใช้เช็คว่าอุปกรณ์ขาดการติดต่อไปหรือยัง (ดู checkDevices.js) —
+        // ประทับตรงนี้เพราะ route นี้ไม่ได้เขียนลง Logs subcollection เลย
+        lastSeen: admin.firestore.FieldValue.serverTimestamp(),
       },
       { merge: true }
     );
