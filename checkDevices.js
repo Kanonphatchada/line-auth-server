@@ -120,6 +120,12 @@ export async function checkDevices() {
     } else if (!isStale && data.offline === true) {
       updates.offline = false;
       onlineCleared++;
+      if (data.uid) {
+        await sendLineAlert(
+          data.uid,
+          `✅ อุปกรณ์ "${doc.id}" กลับมาเชื่อมต่อได้ปกติแล้ว`
+        );
+      }
     }
 
     // 3) เช็คว่า Valve เปลี่ยนสถานะไปจากรอบที่แล้วไหม (เทียบกับค่าที่จำไว้
@@ -191,6 +197,12 @@ export async function checkDevices() {
             }
           } else {
             faultsCleared++;
+            if (data.uid) {
+              await sendLineAlert(
+                data.uid,
+                `✅ อุปกรณ์ "${doc.id}" วาล์วกลับมาทำงานปกติแล้ว`
+              );
+            }
           }
         }
       }
