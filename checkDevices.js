@@ -41,6 +41,30 @@ async function sendLineAlert(uid, text) {
   }
 }
 
+// เปิด incident ใหม่ใน ESP32/{nanoId}/Incidents ไว้เป็นประวัติถาวร (แยกจาก
+// field offline/faultType ที่บอกแค่สถานะปัจจุบัน) ให้หน้า History เอาไปนับ
+// จำนวนครั้ง/สาเหตุ/ช่วงเวลาที่พังย้อนหลังได้ — คืน id ของ incident ที่เปิด
+// ไว้ เก็บไว้บน ESP32 doc เอง จะได้รู้ว่าต้องปิด incident ไหนตอนหายแล้ว
+async function openIncident(doc, type, cause) {
+  const ref = doc.ref.collection("Incidents").doc();
+  await ref.set({
+    type,
+    cause,
+    startedAt: admin.firestore.FieldValue.serverTimestamp(),
+    resolvedAt: null,
+  });
+  return ref.id;
+}
+
+async function closeIncident(doc, incidentId) {
+  if (!incidentId) return;
+  await doc.ref
+    .collection("Incidents")
+    .doc(incidentId)
+    .update({ resolvedAt: admin.firestore.FieldValue.serverTimestamp() })
+    .catch((err) => console.error("❌ closeIncident error:", err));
+}
+
 // อุปกรณ์ควรรายงานค่าเข้ามาสม่ำเสมอ (ทุก 5 นาทีตามสเปกจริง) ถ้าเงียบไปนาน
 // ผิดปกติ น่าจะพัง/หลุดการเชื่อมต่อ
 const OFFLINE_THRESHOLD_MS = 30 * 60 * 1000; // 30 นาที
@@ -111,6 +135,11 @@ export async function checkDevices() {
     if (isStale && data.offline !== true) {
       updates.offline = true;
       offlineFlagged++;
+      updates.openOfflineIncidentId = await openIncident(
+        doc,
+        "offline",
+        "อุปกรณ์ขาดการติดต่อเกิน 30 นาที"
+      );
       if (data.uid) {
         await sendLineAlert(
           data.uid,
@@ -119,7 +148,9 @@ export async function checkDevices() {
       }
     } else if (!isStale && data.offline === true) {
       updates.offline = false;
+      updates.openOfflineIncidentId = admin.firestore.FieldValue.delete();
       onlineCleared++;
+      await closeIncident(doc, data.openOfflineIncidentId);
       if (data.uid) {
         await sendLineAlert(
           data.uid,
@@ -147,9 +178,12 @@ export async function checkDevices() {
 
     if (isStale) {
       // ขาดการติดต่ออยู่แล้ว ไม่ต้องซ้ำเรื่องวาล์ว เคลียร์ป้ายวาล์วทิ้งไปก่อน
+      // (ปิด incident เงียบๆ ไม่ถือว่า "หายแล้ว" จริง เลยไม่ส่ง LINE)
       if (data.faultType) {
         updates.faultType = admin.firestore.FieldValue.delete();
+        updates.openFaultIncidentId = admin.firestore.FieldValue.delete();
         faultsCleared++;
+        await closeIncident(doc, data.openFaultIncidentId);
       }
     } else if (canJudgeValve) {
       const logsSnap = await doc.ref
@@ -185,11 +219,16 @@ export async function checkDevices() {
             : admin.firestore.FieldValue.delete();
           if (faultType) {
             faultsFlagged++;
+            const label =
+              faultType === "valve_stuck_open"
+                ? "วาล์วค้างเปิด (น้ำอาจไหลไม่หยุด)"
+                : "วาล์วอาจไม่ทำงาน (เปิดน้ำแล้วความชื้นไม่ขึ้น)";
+            updates.openFaultIncidentId = await openIncident(
+              doc,
+              faultType,
+              label
+            );
             if (data.uid) {
-              const label =
-                faultType === "valve_stuck_open"
-                  ? "วาล์วค้างเปิด (น้ำอาจไหลไม่หยุด)"
-                  : "วาล์วอาจไม่ทำงาน (เปิดน้ำแล้วความชื้นไม่ขึ้น)";
               await sendLineAlert(
                 data.uid,
                 `🚱 อุปกรณ์ "${doc.id}" ${label} ลองตรวจสอบวาล์ว/ท่อน้ำด้วยครับ`
@@ -197,6 +236,8 @@ export async function checkDevices() {
             }
           } else {
             faultsCleared++;
+            updates.openFaultIncidentId = admin.firestore.FieldValue.delete();
+            await closeIncident(doc, data.openFaultIncidentId);
             if (data.uid) {
               await sendLineAlert(
                 data.uid,
