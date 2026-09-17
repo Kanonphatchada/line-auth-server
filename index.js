@@ -243,6 +243,31 @@ app.get("/debug/incidents/:nanoId", async (req, res) => {
   }
 });
 
+// TEMP — ลบ field Time ที่เราเผลอยัดค่าทดสอบ ("test"/"test2"/"test3"/"test4")
+// ทับไว้ตอนทดสอบ offline-detection ก่อนหน้านี้ (ไม่เกี่ยวกับ firmware ของ
+// เพื่อนเลย) ใช้ .update() ไม่ใช่ .set(merge:true) เพื่อแตะแค่ field เดียว
+// ไม่ไปกระทบ Moisture/Valve/Auto/lastSeen ที่เป็นค่าจริงของอุปกรณ์
+app.get("/debug/clear-time", async (req, res) => {
+  if (!process.env.CRON_SECRET || req.query.key !== process.env.CRON_SECRET) {
+    return res.status(401).send("Unauthorized");
+  }
+  const { nano } = req.query;
+  if (!nano) {
+    return res.status(400).send("Missing nano");
+  }
+  try {
+    await admin
+      .firestore()
+      .collection("ESP32")
+      .doc(nano)
+      .update({ Time: admin.firestore.FieldValue.delete() });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("❌ debug/clear-time:", err);
+    res.status(500).send("Error");
+  }
+});
+
 app.get("/debug/device/:nanoId", async (req, res) => {
   if (!process.env.CRON_SECRET || req.query.key !== process.env.CRON_SECRET) {
     return res.status(401).send("Unauthorized");
