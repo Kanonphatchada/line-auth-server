@@ -210,6 +210,30 @@ app.get("/debug/set-error", async (req, res) => {
   }
 });
 
+// TEMP — จำลอง "อุปกรณ์รายงานสำเร็จอีกครั้ง" แค่ field lastSeen ตัวเดียว
+// (ไม่แตะ Moisture/Valve/Auto/Time เลย) ใช้แทน /update ตอนทดสอบ เพื่อไม่ให้
+// เผลอไปเขียนทับ Time ซ้ำเหมือนที่เคยพลาดมาก่อน
+app.get("/debug/touch-lastseen", async (req, res) => {
+  if (!process.env.CRON_SECRET || req.query.key !== process.env.CRON_SECRET) {
+    return res.status(401).send("Unauthorized");
+  }
+  const { nano } = req.query;
+  if (!nano) {
+    return res.status(400).send("Missing nano");
+  }
+  try {
+    await admin
+      .firestore()
+      .collection("ESP32")
+      .doc(nano)
+      .update({ lastSeen: admin.firestore.FieldValue.serverTimestamp() });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("❌ debug/touch-lastseen:", err);
+    res.status(500).send("Error");
+  }
+});
+
 app.get("/debug/incidents/:nanoId", async (req, res) => {
   if (!process.env.CRON_SECRET || req.query.key !== process.env.CRON_SECRET) {
     return res.status(401).send("Unauthorized");
