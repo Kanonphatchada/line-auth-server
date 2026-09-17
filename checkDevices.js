@@ -77,6 +77,26 @@ const MOISTURE_NOISE_FLOOR_PERCENT = 3;
 // ต้องรอให้คำสั่งวาล์วนิ่ง (ไม่เพิ่งสั่งเปลี่ยน) มานานพอจะดูแนวโน้มได้จริง
 const VALVE_STABLE_MS = 30 * 60 * 1000; // 30 นาที
 
+// error ที่ firmware ของเพื่อน (Nano → ESP32 → Firebase) เขียนตรงๆ ลง field
+// Error/ErrorTime บนตัว ESP32 doc — map ข้อความไปเป็น incident type/label ของ
+// เรา ไม่รวม "WiFi Disconnected" (errorCode -1) เพราะเพื่อนยืนยันว่าเคสนี้
+// ไม่มีทางส่งค่าขึ้น Firestore ได้จริง (ตอน WiFi หลุดคือตอนที่ส่งอะไรขึ้น
+// Firebase ไม่ได้เลยพอดี) ใส่ไว้ในนี้ก็จะไม่มีวันถูกจับได้อยู่ดี
+const FIRMWARE_ERROR_TYPES = {
+  "Sensor Read Error": {
+    type: "sensor_error",
+    label: "เซนเซอร์อ่านค่าความชื้นไม่สำเร็จ (รายงานจากอุปกรณ์)",
+  },
+  "Nano Not Responding": {
+    type: "nano_error",
+    label: "ESP32 ติดต่อ Nano ไม่ได้ (รายงานจากอุปกรณ์)",
+  },
+  "Valve ON but moisture not rising": {
+    type: "valve_no_flow",
+    label: "เปิดวาล์วแล้วความชื้นไม่ขึ้นภายใน 2 นาที (รายงานจากอุปกรณ์)",
+  },
+};
+
 // ฟังก์ชันนี้แทนที่ Cloud Functions ทั้ง 4 ตัวที่เขียนไว้ก่อนหน้า (ซึ่ง deploy
 // ไม่ได้เพราะโปรเจกต์ยังอยู่ Firebase plan ฟรี) — ทำงานแบบ "โพล" เรียกผ่าน
 // route /cron/check-devices ใน index.js โดยมี cron ภายนอกฟรียิงเข้ามาเป็น
@@ -159,9 +179,17 @@ export async function checkDevices() {
       }
     }
 
-    // 3) เช็คว่า Valve เปลี่ยนสถานะไปจากรอบที่แล้วไหม (เทียบกับค่าที่จำไว้
-    //    ตอนโพลรอบก่อน) ถ้าเปลี่ยน บันทึกเวลาไว้ก่อน ยังตัดสินไม่ได้รอบนี้
-    //    ต้องรอให้นิ่งครบ VALVE_STABLE_MS ก่อนถึงจะดูแนวโน้มความชื้นได้
+    // 3) ป้าย "faultType" ตัวเดียวต่ออุปกรณ์ ครอบคลุมปัญหาที่ไม่ใช่ offline
+    //    ทั้งหมด มี 2 แหล่งสัญญาณที่แก้ไขค่าเดียวกันนี้ได้:
+    //      (a) แนวโน้มความชื้นที่เราคำนวณเอง (เดิม, ผ่าน 30 นาที)
+    //      (b) firmware รายงานตรงๆ ผ่าน Error/ErrorTime (ไวกว่ามาก — เพื่อน
+    //          ยืนยันว่า ~2 นาทีสำหรับ valve, ทันทีสำหรับ sensor/nano)
+    //    เก็บผลไว้ใน effectiveFaultType/effectiveOpenFaultIncidentId ตัวแปร
+    //    เดียวก่อน ค่อยเขียนลง Firestore ครั้งเดียวตอนท้าย กันสองแหล่งสัญญาณ
+    //    เปิด/ปิด incident ทับกันเองในรอบเดียวกัน
+    let effectiveFaultType = data.faultType || null;
+    let effectiveOpenFaultIncidentId = data.openFaultIncidentId || null;
+
     const valveIsOpen = data.Valve === true;
     const valveJustChanged = data._lastCheckedValve !== valveIsOpen;
     const valveChangedAtMs = data.valveChangedAt?.toMillis?.() ?? 0;
@@ -177,76 +205,162 @@ export async function checkDevices() {
       now.toMillis() - valveChangedAtMs >= VALVE_STABLE_MS;
 
     if (isStale) {
-      // ขาดการติดต่ออยู่แล้ว ไม่ต้องซ้ำเรื่องวาล์ว เคลียร์ป้ายวาล์วทิ้งไปก่อน
-      // (ปิด incident เงียบๆ ไม่ถือว่า "หายแล้ว" จริง เลยไม่ส่ง LINE)
-      if (data.faultType) {
-        updates.faultType = admin.firestore.FieldValue.delete();
-        updates.openFaultIncidentId = admin.firestore.FieldValue.delete();
+      // ขาดการติดต่ออยู่แล้ว ไม่ต้องซ้ำเรื่องอื่น เคลียร์ป้ายทิ้งไปก่อน (ปิด
+      // incident เงียบๆ ไม่ถือว่า "หายแล้ว" จริง เลยไม่ส่ง LINE)
+      if (effectiveFaultType) {
         faultsCleared++;
-        await closeIncident(doc, data.openFaultIncidentId);
+        await closeIncident(doc, effectiveOpenFaultIncidentId);
+        effectiveFaultType = null;
+        effectiveOpenFaultIncidentId = null;
       }
-    } else if (canJudgeValve) {
-      const logsSnap = await doc.ref
-        .collection("Logs")
-        .where(
-          "timestamp",
-          ">=",
-          admin.firestore.Timestamp.fromMillis(
-            now.toMillis() - VALVE_STABLE_MS
-          )
-        )
-        .orderBy("timestamp", "asc")
-        .get();
+    } else {
+      // 3a) firmware รายงาน error ตรงๆ ผ่าน Error/ErrorTime — เพื่อนยืนยันว่า
+      //     "พอกลับมาทำงานปกติมันไม่เคลียร์ให้" คือ field นี้ค้างค่าเดิมไว้
+      //     ตลอดไปเองในฝั่ง firmware ดังนั้นห้ามใช้การที่ Error หายไปเป็น
+      //     สัญญาณว่า "หายแล้ว" — ใช้ ErrorTime แค่จับ "มี error ใหม่เกิดขึ้น"
+      //     (ค่าขยับจากที่เช็ครอบก่อน) ส่วนการปิด incident ให้ไปดูที่ (3c)
+      const errorText = data.Error || null;
+      const errorTimeMs = data.ErrorTime?.toMillis?.() ?? null;
+      const lastCheckedErrorTimeMs =
+        data._lastCheckedErrorTime?.toMillis?.() ?? null;
+      const isNewFirmwareError =
+        errorText !== null &&
+        errorTimeMs !== null &&
+        errorTimeMs !== lastCheckedErrorTimeMs;
 
-      const readings = logsSnap.docs
-        .map((d) => d.data().moisture)
-        .filter((m) => typeof m === "number");
+      if (isNewFirmwareError) {
+        const mapped = FIRMWARE_ERROR_TYPES[errorText];
 
-      if (readings.length >= 2) {
-        const delta = readings[readings.length - 1] - readings[0];
-
-        let faultType = null;
-        if (!valveIsOpen && delta > MOISTURE_NOISE_FLOOR_PERCENT) {
-          faultType = "valve_stuck_open";
-        } else if (valveIsOpen && delta < MOISTURE_NOISE_FLOOR_PERCENT) {
-          faultType = "valve_no_flow";
-        }
-
-        const currentFault = data.faultType || null;
-        if (currentFault !== faultType) {
-          updates.faultType = faultType
-            ? faultType
-            : admin.firestore.FieldValue.delete();
-          if (faultType) {
-            faultsFlagged++;
-            const label =
-              faultType === "valve_stuck_open"
-                ? "วาล์วค้างเปิด (น้ำอาจไหลไม่หยุด)"
-                : "วาล์วอาจไม่ทำงาน (เปิดน้ำแล้วความชื้นไม่ขึ้น)";
-            updates.openFaultIncidentId = await openIncident(
-              doc,
-              faultType,
-              label
+        if (!mapped) {
+          // ข้อความ error ที่ยังไม่รู้จัก (เช่น "WiFi Disconnected" ที่ตาม
+          // ที่เพื่อนยืนยัน ไม่มีทางส่งมาถึง Firestore ได้จริงอยู่แล้ว) —
+          // จำไว้ว่าเช็คแล้ว ไม่ต้อง retry ทุกรอบ แต่ไม่เปิด incident ให้
+          updates._lastCheckedErrorTime = data.ErrorTime;
+        } else if (effectiveFaultType === null) {
+          // ช่องว่าง เปิด incident ใหม่จากสัญญาณของ firmware ได้เลย
+          updates._lastCheckedErrorTime = data.ErrorTime;
+          faultsFlagged++;
+          effectiveOpenFaultIncidentId = await openIncident(
+            doc,
+            mapped.type,
+            mapped.label
+          );
+          effectiveFaultType = mapped.type;
+          if (data.uid) {
+            await sendLineAlert(
+              data.uid,
+              `🚱 อุปกรณ์ "${doc.id}" ${mapped.label}`
             );
-            if (data.uid) {
-              await sendLineAlert(
-                data.uid,
-                `🚱 อุปกรณ์ "${doc.id}" ${label} ลองตรวจสอบวาล์ว/ท่อน้ำด้วยครับ`
+          }
+        }
+        // ถ้า mapped แต่ช่องไม่ว่าง (มี fault อื่นเปิดค้างอยู่แล้ว) จะไม่มาร์ค
+        // ว่าเช็คแล้ว รอรอบหน้าให้ช่องว่างก่อนค่อยเปิดให้
+      }
+
+      // 3b) แนวโน้มความชื้นที่เราคำนวณเอง (เดิม) — ให้ทำงานเฉพาะตอนช่องว่าง
+      //     หรือช่องนั้นเป็นปัญหาวาล์วอยู่แล้ว กันไม่ให้ไปทับ sensor/nano
+      //     error ที่ firmware เพิ่งรายงานเข้ามาในรอบเดียวกัน
+      if (
+        canJudgeValve &&
+        (effectiveFaultType === null ||
+          effectiveFaultType === "valve_stuck_open" ||
+          effectiveFaultType === "valve_no_flow")
+      ) {
+        const logsSnap = await doc.ref
+          .collection("Logs")
+          .where(
+            "timestamp",
+            ">=",
+            admin.firestore.Timestamp.fromMillis(
+              now.toMillis() - VALVE_STABLE_MS
+            )
+          )
+          .orderBy("timestamp", "asc")
+          .get();
+
+        const readings = logsSnap.docs
+          .map((d) => d.data().moisture)
+          .filter((m) => typeof m === "number");
+
+        if (readings.length >= 2) {
+          const delta = readings[readings.length - 1] - readings[0];
+
+          let trendFaultType = null;
+          if (!valveIsOpen && delta > MOISTURE_NOISE_FLOOR_PERCENT) {
+            trendFaultType = "valve_stuck_open";
+          } else if (valveIsOpen && delta < MOISTURE_NOISE_FLOOR_PERCENT) {
+            trendFaultType = "valve_no_flow";
+          }
+
+          if (effectiveFaultType !== trendFaultType) {
+            if (trendFaultType) {
+              faultsFlagged++;
+              const label =
+                trendFaultType === "valve_stuck_open"
+                  ? "วาล์วค้างเปิด (น้ำอาจไหลไม่หยุด)"
+                  : "วาล์วอาจไม่ทำงาน (เปิดน้ำแล้วความชื้นไม่ขึ้น)";
+              effectiveOpenFaultIncidentId = await openIncident(
+                doc,
+                trendFaultType,
+                label
               );
-            }
-          } else {
-            faultsCleared++;
-            updates.openFaultIncidentId = admin.firestore.FieldValue.delete();
-            await closeIncident(doc, data.openFaultIncidentId);
-            if (data.uid) {
-              await sendLineAlert(
-                data.uid,
-                `✅ อุปกรณ์ "${doc.id}" วาล์วกลับมาทำงานปกติแล้ว`
-              );
+              effectiveFaultType = trendFaultType;
+              if (data.uid) {
+                await sendLineAlert(
+                  data.uid,
+                  `🚱 อุปกรณ์ "${doc.id}" ${label} ลองตรวจสอบวาล์ว/ท่อน้ำด้วยครับ`
+                );
+              }
+            } else {
+              faultsCleared++;
+              await closeIncident(doc, effectiveOpenFaultIncidentId);
+              effectiveFaultType = null;
+              effectiveOpenFaultIncidentId = null;
+              if (data.uid) {
+                await sendLineAlert(
+                  data.uid,
+                  `✅ อุปกรณ์ "${doc.id}" วาล์วกลับมาทำงานปกติแล้ว`
+                );
+              }
             }
           }
         }
       }
+
+      // 3c) ปิด incident ที่มาจาก firmware error (sensor_error/nano_error)
+      //     เอง เมื่อพบว่าอุปกรณ์รายงานค่าใหม่สำเร็จหลังจากเวลาที่ error เกิด
+      //     (lastSeen ใหม่กว่า ErrorTime) — ต้องทำเองเพราะ Error/ErrorTime
+      //     ฝั่ง firmware ไม่เคลียร์ค่าให้เอง (ยืนยันจากเพื่อนแล้ว)
+      if (
+        (effectiveFaultType === "sensor_error" ||
+          effectiveFaultType === "nano_error") &&
+        effectiveOpenFaultIncidentId &&
+        lastSeenMs !== null &&
+        data.ErrorTime?.toMillis?.() != null &&
+        lastSeenMs > data.ErrorTime.toMillis()
+      ) {
+        faultsCleared++;
+        await closeIncident(doc, effectiveOpenFaultIncidentId);
+        effectiveFaultType = null;
+        effectiveOpenFaultIncidentId = null;
+        if (data.uid) {
+          await sendLineAlert(
+            data.uid,
+            `✅ อุปกรณ์ "${doc.id}" กลับมาทำงานปกติแล้ว`
+          );
+        }
+      }
+    }
+
+    if (effectiveFaultType !== (data.faultType || null)) {
+      updates.faultType = effectiveFaultType
+        ? effectiveFaultType
+        : admin.firestore.FieldValue.delete();
+    }
+    if (effectiveOpenFaultIncidentId !== (data.openFaultIncidentId || null)) {
+      updates.openFaultIncidentId = effectiveOpenFaultIncidentId
+        ? effectiveOpenFaultIncidentId
+        : admin.firestore.FieldValue.delete();
     }
 
     if (Object.keys(updates).length > 0) {

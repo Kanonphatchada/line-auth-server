@@ -177,3 +177,85 @@ app.get("/cron/check-devices", async (req, res) => {
     res.status(500).send("Error");
   }
 });
+
+/* =====================================================
+   TEMP DEBUG — จำลอง firmware เขียน Error/ErrorTime ลงอุปกรณ์ตรงๆ
+   เพื่อทดสอบ checkDevices.js ก่อนจะพึ่งพา field จริงจากฮาร์ดแวร์ ลบทิ้งหลัง
+   ทดสอบเสร็จ (เหมือน /debug/incidents รอบก่อน)
+===================================================== */
+app.get("/debug/set-error", async (req, res) => {
+  if (!process.env.CRON_SECRET || req.query.key !== process.env.CRON_SECRET) {
+    return res.status(401).send("Unauthorized");
+  }
+  const { nano, error } = req.query;
+  if (!nano || !error) {
+    return res.status(400).send("Missing nano or error");
+  }
+  try {
+    await admin
+      .firestore()
+      .collection("ESP32")
+      .doc(nano)
+      .set(
+        {
+          Error: error,
+          ErrorTime: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("❌ debug/set-error:", err);
+    res.status(500).send("Error");
+  }
+});
+
+app.get("/debug/incidents/:nanoId", async (req, res) => {
+  if (!process.env.CRON_SECRET || req.query.key !== process.env.CRON_SECRET) {
+    return res.status(401).send("Unauthorized");
+  }
+  try {
+    const snap = await admin
+      .firestore()
+      .collection("ESP32")
+      .doc(req.params.nanoId)
+      .collection("Incidents")
+      .orderBy("startedAt", "desc")
+      .limit(5)
+      .get();
+    res.json({
+      ok: true,
+      count: snap.size,
+      incidents: snap.docs.map((d) => {
+        const v = d.data();
+        return {
+          id: d.id,
+          type: v.type,
+          cause: v.cause,
+          startedAt: v.startedAt?.toDate?.() ?? null,
+          resolvedAt: v.resolvedAt?.toDate?.() ?? null,
+        };
+      }),
+    });
+  } catch (err) {
+    console.error("❌ debug/incidents:", err);
+    res.status(500).send("Error");
+  }
+});
+
+app.get("/debug/device/:nanoId", async (req, res) => {
+  if (!process.env.CRON_SECRET || req.query.key !== process.env.CRON_SECRET) {
+    return res.status(401).send("Unauthorized");
+  }
+  try {
+    const doc = await admin
+      .firestore()
+      .collection("ESP32")
+      .doc(req.params.nanoId)
+      .get();
+    res.json({ ok: true, data: doc.exists ? doc.data() : null });
+  } catch (err) {
+    console.error("❌ debug/device:", err);
+    res.status(500).send("Error");
+  }
+});
