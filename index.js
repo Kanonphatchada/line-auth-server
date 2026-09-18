@@ -180,3 +180,65 @@ app.get("/cron/check-devices", async (req, res) => {
 
 // (debug routes ที่ใช้ทดสอบ Error/ErrorTime integration ถูกลบออกแล้ว —
 // ทดสอบผ่านครบทุกเคสแล้ว ดู commit history ของ render-cron ถ้าต้องดูย้อนหลัง)
+
+/* =====================================================
+   ยกเลิกการผูกอุปกรณ์ (unclaim) — ทำผ่าน route นี้ด้วย Admin SDK แทนที่จะ
+   เปิด Firestore rule ให้ client เคลียร์ uid/ownerUid เองได้ตรงๆ (ซึ่งต้อง
+   แก้ rule เพิ่ม เสี่ยงกระทบ path อื่นที่ฮาร์ดแวร์ใช้อยู่โดยไม่ตั้งใจ) ยืนยัน
+   ตัวตนผู้เรียกด้วย Firebase ID token (ออกให้ตอน login) เช็คว่าเป็นเจ้าของ
+   กลุ่มอุปกรณ์นั้นจริงก่อนถึงจะล้าง uid ให้
+===================================================== */
+app.post("/unclaim-device", async (req, res) => {
+  const authHeader = req.headers.authorization || "";
+  const idToken = authHeader.startsWith("Bearer ")
+    ? authHeader.slice("Bearer ".length)
+    : null;
+
+  if (!idToken) {
+    return res.status(401).send("Unauthorized");
+  }
+
+  let uid;
+  try {
+    const decoded = await admin.auth().verifyIdToken(idToken);
+    uid = decoded.uid;
+  } catch (err) {
+    return res.status(401).send("Unauthorized");
+  }
+
+  const { groupId } = req.body;
+  if (!groupId) {
+    return res.status(400).send("Missing groupId");
+  }
+
+  try {
+    const registryRef = admin
+      .firestore()
+      .collection("device_registry")
+      .doc(groupId);
+    const registryDoc = await registryRef.get();
+
+    if (!registryDoc.exists || registryDoc.data().ownerUid !== uid) {
+      return res.status(403).send("Forbidden");
+    }
+
+    const esp32Snap = await admin
+      .firestore()
+      .collection("ESP32")
+      .where("groupId", "==", groupId)
+      .get();
+
+    const batch = admin.firestore().batch();
+    batch.update(registryRef, { ownerUid: null });
+    for (const doc of esp32Snap.docs) {
+      batch.update(doc.ref, { uid: admin.firestore.FieldValue.delete() });
+    }
+    await batch.commit();
+
+    console.log(`✅ ยกเลิกการผูกอุปกรณ์กลุ่ม ${groupId} โดย ${uid}`);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("❌ unclaim-device error:", err);
+    res.status(500).send("Error");
+  }
+});

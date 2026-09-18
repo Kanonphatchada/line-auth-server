@@ -8,16 +8,31 @@ import fetch from "node-fetch";
 // lineUserId ที่เก็บไว้ตอน login แล้ว (users/{uid}.lineUserId) ไม่ต้องสร้าง
 // ระบบ map ผู้ใช้ใหม่ ถ้ายังไม่ได้ตั้ง LINE_MESSAGING_TOKEN หรือหา
 // lineUserId ไม่เจอ จะข้ามไปเงียบๆ ไม่ทำให้ checkDevices ทั้งรอบพัง
-async function sendLineAlert(uid, text) {
+//
+// category เป็น "offline" หรือ "fault" — เอาไว้เช็คว่าผู้ใช้ปิดการแจ้งเตือน
+// ประเภทนั้นไว้หรือเปล่า (users/{uid}.notifyOffline / .notifyFault) ถ้ายังไม่
+// เคยตั้งค่าไว้เลย (undefined) ถือว่าเปิดรับไว้ก่อน ไม่ให้ผู้ใช้เดิมที่ไม่เคย
+// ตั้งค่าอะไรหยุดได้รับแจ้งเตือนไปเฉยๆ
+async function sendLineAlert(uid, text, category) {
   if (!process.env.LINE_MESSAGING_TOKEN) {
     return;
   }
 
   try {
     const userDoc = await admin.firestore().collection("users").doc(uid).get();
-    const lineUserId = userDoc.exists ? userDoc.data().lineUserId : null;
+    if (!userDoc.exists) {
+      return;
+    }
+
+    const userData = userDoc.data();
+    const lineUserId = userData.lineUserId;
 
     if (!lineUserId) {
+      return;
+    }
+
+    const prefField = category === "offline" ? "notifyOffline" : "notifyFault";
+    if (userData[prefField] === false) {
       return;
     }
 
@@ -163,7 +178,8 @@ export async function checkDevices() {
       if (data.uid) {
         await sendLineAlert(
           data.uid,
-          `⚠️ อุปกรณ์ "${doc.id}" ขาดการติดต่อเกิน 30 นาที ลองตรวจสอบสัญญาณ/แหล่งจ่ายไฟด้วยครับ`
+          `⚠️ อุปกรณ์ "${doc.id}" ขาดการติดต่อเกิน 30 นาที ลองตรวจสอบสัญญาณ/แหล่งจ่ายไฟด้วยครับ`,
+          "offline"
         );
       }
     } else if (!isStale && data.offline === true) {
@@ -174,7 +190,8 @@ export async function checkDevices() {
       if (data.uid) {
         await sendLineAlert(
           data.uid,
-          `✅ อุปกรณ์ "${doc.id}" กลับมาเชื่อมต่อได้ปกติแล้ว`
+          `✅ อุปกรณ์ "${doc.id}" กลับมาเชื่อมต่อได้ปกติแล้ว`,
+          "offline"
         );
       }
     }
@@ -249,7 +266,8 @@ export async function checkDevices() {
           if (data.uid) {
             await sendLineAlert(
               data.uid,
-              `🚱 อุปกรณ์ "${doc.id}" ${mapped.label}`
+              `🚱 อุปกรณ์ "${doc.id}" ${mapped.label}`,
+              "fault"
             );
           }
         }
@@ -308,7 +326,8 @@ export async function checkDevices() {
               if (data.uid) {
                 await sendLineAlert(
                   data.uid,
-                  `🚱 อุปกรณ์ "${doc.id}" ${label} ลองตรวจสอบวาล์ว/ท่อน้ำด้วยครับ`
+                  `🚱 อุปกรณ์ "${doc.id}" ${label} ลองตรวจสอบวาล์ว/ท่อน้ำด้วยครับ`,
+                  "fault"
                 );
               }
             } else {
@@ -319,7 +338,8 @@ export async function checkDevices() {
               if (data.uid) {
                 await sendLineAlert(
                   data.uid,
-                  `✅ อุปกรณ์ "${doc.id}" วาล์วกลับมาทำงานปกติแล้ว`
+                  `✅ อุปกรณ์ "${doc.id}" วาล์วกลับมาทำงานปกติแล้ว`,
+                  "fault"
                 );
               }
             }
@@ -346,7 +366,8 @@ export async function checkDevices() {
         if (data.uid) {
           await sendLineAlert(
             data.uid,
-            `✅ อุปกรณ์ "${doc.id}" กลับมาทำงานปกติแล้ว`
+            `✅ อุปกรณ์ "${doc.id}" กลับมาทำงานปกติแล้ว`,
+            "fault"
           );
         }
       }
