@@ -112,6 +112,95 @@ const FIRMWARE_ERROR_TYPES = {
   },
 };
 
+// เช็คว่าตอนนี้อยู่ในช่วงเวลาที่อนุญาตให้รดน้ำอัตโนมัติไหม (ฟีเจอร์ตั้งเวลา
+// รดน้ำ) — รับ "HH:mm" สองค่า รองรับช่วงข้ามเที่ยงคืนด้วย (เช่น 22:00-06:00)
+// ใช้เวลาไทย (UTC+7) เสมอไม่ว่า server จะตั้ง timezone เป็นอะไรก็ตาม เพราะ
+// Render ไม่รับประกันว่า timezone ของเครื่องจะเป็นอะไร
+function isWithinScheduleWindow(startHHmm, endHHmm) {
+  const toMinutes = (hhmm) => {
+    const [h, m] = hhmm.split(":").map(Number);
+    return h * 60 + m;
+  };
+
+  const nowBangkok = new Date(Date.now() + 7 * 60 * 60 * 1000);
+  const nowMinutes = nowBangkok.getUTCHours() * 60 + nowBangkok.getUTCMinutes();
+
+  const startMinutes = toMinutes(startHHmm);
+  const endMinutes = toMinutes(endHHmm);
+
+  if (startMinutes === endMinutes) return true; // ตั้งเท่ากันถือว่าเปิดทั้งวัน
+  if (startMinutes < endMinutes) {
+    return nowMinutes >= startMinutes && nowMinutes < endMinutes;
+  }
+  // ช่วงข้ามเที่ยงคืน เช่น 22:00 - 06:00
+  return nowMinutes >= startMinutes || nowMinutes < endMinutes;
+}
+
+// หาว่า "ตารางเวลาที่มีผลจริง" ของอุปกรณ์นี้มาจากไหน — ถ้าอุปกรณ์ตั้ง
+// scheduleOverride ไว้เอง (true) ใช้ตารางเวลาของตัวเอง ไม่งั้น fallback ไปใช้
+// ของกลุ่ม/ฟาร์ม (device_registry) แทน ให้ตั้งครั้งเดียวใช้ได้ทั้งฟาร์มเป็น
+// ร้อยอุปกรณ์ ไม่ต้องตั้งทีละตัว — คืน null ถ้าไม่มีตารางเวลาจากที่ไหนเลย
+function resolveScheduleSource(data, groupRegistry) {
+  if (data.scheduleOverride === true) {
+    return {
+      scheduleEnabled: data.scheduleEnabled === true,
+      scheduleMode: data.scheduleMode,
+      scheduleStart: data.scheduleStart,
+      scheduleEnd: data.scheduleEnd,
+    };
+  }
+  if (groupRegistry && groupRegistry.scheduleEnabled !== undefined) {
+    return {
+      scheduleEnabled: groupRegistry.scheduleEnabled === true,
+      scheduleMode: groupRegistry.scheduleMode,
+      scheduleStart: groupRegistry.scheduleStart,
+      scheduleEnd: groupRegistry.scheduleEnd,
+    };
+  }
+  return null;
+}
+
+// คำนวณค่า Auto ที่ "ควรจะเป็นจริงๆ" ตอนนี้ — ถ้าไม่มีตารางเวลาที่เปิดใช้อยู่
+// เลย (ทั้งระดับอุปกรณ์และระดับกลุ่ม) ให้ใช้ค่า Auto เดิมตรงๆ ไม่ยุ่งเลย
+// (ของเดิมทำงานเหมือนเดิม 100%) เปิดใช้ก็ต่อเมื่อผู้ใช้ตั้งค่าไว้ชัดเจน
+// เท่านั้น — desiredAuto คือ "ความตั้งใจ" ของผู้ใช้จากสวิตช์ในแอป (เป็นราย
+// อุปกรณ์เสมอ แม้จะใช้ตารางเวลาของกลุ่มก็ตาม) ถ้ายังไม่เคยมีค่านี้:
+//   - ใช้ตารางเวลาของอุปกรณ์เอง (override) → fallback ไปใช้ค่า Auto ปัจจุบัน
+//     (อุปกรณ์เก่าก่อนมีฟีเจอร์นี้ ผู้ใช้ต้องเคยเปิด Auto เองมาก่อน)
+//   - ใช้ตารางเวลาของกลุ่ม/ฟาร์ม (ไม่ override) → ถือว่า "ยินยอม" ไปเลย
+//     เพราะการเปิดตารางเวลาทั้งฟาร์มคือความตั้งใจของผู้ใช้อยู่แล้วที่จะให้
+//     ทุกอุปกรณ์ในฟาร์มรดน้ำตามตาราง ไม่งั้นอุปกรณ์ที่ Auto ปิดอยู่แต่เดิม
+//     (ปกติของอุปกรณ์ที่ไม่เคยแตะสวิตช์เลย) จะไม่ขยับตามตารางฟาร์มเลยแม้จะ
+//     เปิดใช้ไว้แล้วก็ตาม
+//
+// scheduleMode มี 2 แบบ:
+//   "allow" (default) — รดได้เฉพาะในช่วงเวลานี้เท่านั้น
+//   "block"            — รดได้ตลอด ยกเว้นในช่วงเวลานี้ (เช่น เช้า-เย็น
+//                        ยกเว้นเที่ยง ก็แค่ตั้ง block 11:00-14:00 ไม่ต้องมี
+//                        หลายช่วงเวลาให้ยุ่งยาก)
+function computeEffectiveAuto(data, groupRegistry) {
+  const usingOwnOverride = data.scheduleOverride === true;
+  const schedule = resolveScheduleSource(data, groupRegistry);
+
+  if (!schedule || schedule.scheduleEnabled !== true) {
+    return data.Auto === true;
+  }
+  const desiredAuto =
+    data.desiredAuto !== undefined
+      ? data.desiredAuto === true
+      : usingOwnOverride
+      ? data.Auto === true
+      : true;
+  if (!desiredAuto) return false;
+  if (!schedule.scheduleStart || !schedule.scheduleEnd) return desiredAuto;
+
+  const withinWindow = isWithinScheduleWindow(
+    schedule.scheduleStart,
+    schedule.scheduleEnd
+  );
+  return schedule.scheduleMode === "block" ? !withinWindow : withinWindow;
+}
+
 // ฟังก์ชันนี้แทนที่ Cloud Functions ทั้ง 4 ตัวที่เขียนไว้ก่อนหน้า (ซึ่ง deploy
 // ไม่ได้เพราะโปรเจกต์ยังอยู่ Firebase plan ฟรี) — ทำงานแบบ "โพล" เรียกผ่าน
 // route /cron/check-devices ใน index.js โดยมี cron ภายนอกฟรียิงเข้ามาเป็น
@@ -121,6 +210,14 @@ export async function checkDevices() {
   const db = admin.firestore();
   const now = admin.firestore.Timestamp.now();
   const snapshot = await db.collection("ESP32").get();
+
+  // ดึง device_registry มาครั้งเดียวทั้ง collection แล้วทำ map ไว้ในหน่วยความจำ
+  // แทนอ่านทีละตัวต่ออุปกรณ์ — จำนวน document ในนี้ผูกกับจำนวน "กลุ่ม/ฟาร์ม"
+  // ไม่ใช่จำนวนอุปกรณ์ ต่อให้มีอุปกรณ์เป็นร้อยตัวก็ยังเป็นแค่ไม่กี่สิบกลุ่ม
+  // ประหยัด read quota กว่าเยอะ ใช้หาตารางเวลาระดับกลุ่ม/ฟาร์มด้านล่าง
+  const registrySnapshot = await db.collection("device_registry").get();
+  const registryByGroupId = new Map();
+  registrySnapshot.docs.forEach((d) => registryByGroupId.set(d.id, d.data()));
 
   let assigned = 0;
   let offlineFlagged = 0;
@@ -143,6 +240,23 @@ export async function checkDevices() {
         updates.uid = ownerUid;
         assigned++;
       }
+    }
+
+    // ตั้งเวลารดน้ำ (opt-in ผ่าน scheduleEnabled ระดับอุปกรณ์ตัวเอง หรือ
+    // ระดับกลุ่ม/ฟาร์มที่ device_registry ก็ได้ — ดู resolveScheduleSource)
+    // เช็คซ้ำทุกรอบเผื่อข้ามช่วงเวลาไปโดยไม่มีใครแตะสวิตช์เลย (เช่น เข้าสู่
+    // ช่วงเวลาเปิดตอนตี 6 เอง) ไม่แตะอุปกรณ์ที่ไม่มีตารางเวลาจากที่ไหนเลย
+    // แม้แต่นิดเดียว — computeEffectiveAuto คืนค่าเดิมของ Auto ตรงๆ ในกรณีนั้น
+    const groupRegistry = data.groupId
+      ? registryByGroupId.get(data.groupId)
+      : null;
+    const scheduleSource = resolveScheduleSource(data, groupRegistry);
+    const effectiveAuto = computeEffectiveAuto(data, groupRegistry);
+    if (
+      scheduleSource?.scheduleEnabled === true &&
+      effectiveAuto !== (data.Auto === true)
+    ) {
+      updates.Auto = effectiveAuto;
     }
 
     // 2) เช็คว่ารายงานล่าสุดเมื่อไหร่ — ดูทั้ง field lastSeen บนตัว doc เอง
