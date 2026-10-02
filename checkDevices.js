@@ -31,6 +31,11 @@ async function sendLineAlert(uid, text, category) {
       return;
     }
 
+    // สวิตช์หลักในหน้าโปรไฟล์ — ปิดแล้วไม่ส่งอะไรไป LINE เลย
+    if (userData.notifyLine === false) {
+      return;
+    }
+
     const prefField = category === "offline" ? "notifyOffline" : "notifyFault";
     if (userData[prefField] === false) {
       return;
