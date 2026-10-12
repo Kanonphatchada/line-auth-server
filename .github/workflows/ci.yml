@@ -23,3 +23,6 @@ jobs:
           for f in *.js; do
             node --check "$f"
           done
+
+      - name: Unit tests
+        run: npm test
