@@ -5,6 +5,7 @@ import fetch from "node-fetch";
 import admin from "firebase-admin";
 import dotenv from "dotenv";
 import { checkDevices } from "./checkDevices.js";
+import { planClaim, createAttemptLimiter, CLAIM_ERRORS } from "./claimDevice.js";
 
 dotenv.config();
 
@@ -180,6 +181,89 @@ app.get("/cron/check-devices", async (req, res) => {
 
 // (debug routes ที่ใช้ทดสอบ Error/ErrorTime integration ถูกลบออกแล้ว —
 // ทดสอบผ่านครบทุกเคสแล้ว ดู commit history ของ render-cron ถ้าต้องดูย้อนหลัง)
+
+/* =====================================================
+   เชื่อมอุปกรณ์เข้าบัญชี (claim) — ย้ายมาทำที่ route นี้ด้วย Admin SDK แทน
+   ที่แอปอ่านรหัสลับจาก Firestore แล้วตั้ง uid/ownerUid เอง (ซึ่งทำให้รหัสลับรั่ว
+   และใครก็ผูกอุปกรณ์ได้โดยไม่ต้องใช้รหัส) ตอนนี้รหัสลับไม่ออกจากเซิร์ฟเวอร์
+   ยืนยันตัวตนผู้เรียกด้วย Firebase ID token เหมือน /unclaim-device
+   ตรรกะตัดสินอยู่ใน claimDevice.js (แยกไว้เพื่อเทส)
+===================================================== */
+const claimLimiter = createAttemptLimiter();
+
+app.post("/claim-device", async (req, res) => {
+  const authHeader = req.headers.authorization || "";
+  const idToken = authHeader.startsWith("Bearer ")
+    ? authHeader.slice("Bearer ".length)
+    : null;
+  if (!idToken) {
+    return res.status(401).send("Unauthorized");
+  }
+
+  let uid;
+  try {
+    uid = (await admin.auth().verifyIdToken(idToken)).uid;
+  } catch (err) {
+    return res.status(401).send("Unauthorized");
+  }
+
+  const { deviceId, secret } = req.body ?? {};
+  if (typeof deviceId !== "string" || !deviceId || deviceId.includes("/")) {
+    return res.status(400).send("Missing deviceId");
+  }
+
+  if (claimLimiter.isBlocked(uid)) {
+    return res.status(429).send("ลองรหัสผิดหลายครั้งเกินไป รอสักครู่แล้วลองใหม่");
+  }
+
+  try {
+    const db = admin.firestore();
+    const registryRef = db.collection("device_registry").doc(deviceId);
+    const registrySnap = await registryRef.get();
+    const nanoSnap = await db
+      .collection("ESP32")
+      .where("groupId", "==", deviceId)
+      .get();
+
+    const plan = planClaim({
+      registry: registrySnap.exists ? registrySnap.data() : null,
+      nanoDocs: nanoSnap.docs.map((d) => ({ id: d.id, data: d.data() })),
+      uid,
+      secret,
+    });
+
+    if (plan.error) {
+      if (plan.error === CLAIM_ERRORS.WRONG_SECRET) {
+        claimLimiter.recordFailure(uid);
+      }
+      return res.status(plan.error.status).send(plan.error.message);
+    }
+
+    // ผูก ownerUid ของ device_registry + uid ของทุก nano ในคำสั่งเดียว (atomic)
+    // กันเน็ตหลุดกลางทางจนฟาร์มถูก mark ว่า "ถูกใช้แล้ว" ทั้งที่อุปกรณ์บางตัว
+    // ยังไม่ถูกผูกจริง
+    const batch = db.batch();
+    if (plan.registryUpdate) batch.update(registryRef, plan.registryUpdate);
+    for (const { id, update } of plan.nanoUpdates) {
+      batch.update(db.collection("ESP32").doc(id), update);
+    }
+    await batch.commit();
+
+    claimLimiter.reset(uid);
+    console.log(
+      `✅ ผูกอุปกรณ์ฟาร์ม ${deviceId} โดย ${uid} (${plan.nanoUpdates.length} ตัว` +
+        `${plan.skipped.length ? `, ข้าม ${plan.skipped.length} ตัวที่เป็นของคนอื่น` : ""})`
+    );
+    res.json({
+      ok: true,
+      claimed: plan.nanoUpdates.map((n) => n.id),
+      skipped: plan.skipped,
+    });
+  } catch (err) {
+    console.error("❌ claim-device error:", err);
+    res.status(500).send("Error");
+  }
+});
 
 /* =====================================================
    ยกเลิกการผูกอุปกรณ์ (unclaim) — ทำผ่าน route นี้ด้วย Admin SDK แทนที่จะ
