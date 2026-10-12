@@ -1,5 +1,6 @@
 import admin from "firebase-admin";
 import fetch from "node-fetch";
+import { evaluateRainForecast, decideRainSkip } from "./rainDecision.js";
 
 // ไม่เรียก admin.initializeApp() ในไฟล์นี้ — ฟังก์ชันนี้ถูก import เข้าไปใช้
 // ใน index.js ซึ่ง initialize แอปไว้แล้วตั้งแต่ตอนเริ่มเซิร์ฟเวอร์
@@ -206,20 +207,15 @@ function computeEffectiveAuto(data, groupRegistry) {
   return schedule.scheduleMode === "block" ? !withinWindow : withinWindow;
 }
 
-// เกณฑ์ตัดสินว่า "ฝนน่าจะตก" พอที่จะข้ามรอบรดน้ำอัตโนมัติไปเลย — ต้องเข้มทั้ง
-// โอกาส% และปริมาณฝนจริง (ไม่ใช่แค่โอกาสสูงอย่างเดียว) กันเคส "โอกาสฝน 70%
-// แต่ตกแค่ปรอยๆ ไม่ถึง 1mm" ทำให้ข้ามรดน้ำทั้งที่ดินยังแห้งอยู่ดี
-const RAIN_PROBABILITY_THRESHOLD = 70; // %
-const RAIN_PRECIP_MM_THRESHOLD = 1; // mm รวมในช่วงที่เช็ค
-const RAIN_LOOKAHEAD_HOURS = 3;
-const WEATHER_CACHE_MS = 20 * 60 * 1000; // เช็คซ้ำถี่สุดทุก 20 นาที กันยิง API บ่อยเกินจำเป็น
-
 // เช็คพยากรณ์ฝนของฟาร์มนี้ (Open-Meteo ฟรี ไม่ต้องมี API key) — ถ้าฝนน่าจะตก
 // เร็วๆนี้ ให้ข้ามรอบรดน้ำอัตโนมัติของทั้งฟาร์มไปเลย ประหยัดน้ำจริง แต่กัน
-// เคสพยากรณ์ผิด (บอกว่าฝนจะตกแต่ไม่ตกจริง) ด้วยการไม่ข้าม 2 รอบติดกันเด็ดขาด
-// — อย่างมากพลาดแค่ 1 รอบ ไม่ทำให้ต้นไม้ขาดน้ำนานเกินไป ผลลัพธ์แคชไว้ใน
+// เคสพยากรณ์ผิดด้วยเพดานเวลา: ข้ามต่อเนื่องได้ไม่เกิน RAIN_SKIP_MAX_MS นับจาก
+// ตอนเริ่มข้าม (เก็บใน _rainSkipStartedAt) — ฝนหมดเมื่อไหร่ก็กลับมารดทันที
+// เกณฑ์/ตรรกะตัดสินอยู่ใน rainDecision.js (แยกไว้เพื่อเทส) ผลพยากรณ์แคชไว้ใน
 // device_registry เองเพื่อใช้ข้ามหลายอุปกรณ์ในฟาร์มเดียวกันได้โดยไม่ต้องยิง
 // API ซ้ำต่ออุปกรณ์
+const WEATHER_CACHE_MS = 20 * 60 * 1000; // เช็คซ้ำถี่สุดทุก 20 นาที กันยิง API บ่อยเกินจำเป็น
+
 async function computeRainSkip(db, groupId, registryData) {
   if (
     registryData?.rainSkipEnabled !== true ||
@@ -229,43 +225,31 @@ async function computeRainSkip(db, groupId, registryData) {
     return { skip: false };
   }
 
+  const registryRef = db.collection("device_registry").doc(groupId);
+  const nowMs = Date.now();
   const checkedAtMs = registryData._weatherCheckedAt?.toMillis?.() ?? 0;
   let rainForecast = registryData._rainForecast === true;
 
-  if (Date.now() - checkedAtMs > WEATHER_CACHE_MS) {
+  if (nowMs - checkedAtMs > WEATHER_CACHE_MS) {
     try {
+      // timeformat=unixtime → เวลาเป็น epoch วินาที (UTC) เทียบกับ Date.now()
+      // ได้ตรงๆ ไม่ต้องแปลงเขตเวลา; ขอ 2 วันเผื่อช่วงดึกที่ข้อมูลของวันนี้ไม่พอ
       const url =
         `https://api.open-meteo.com/v1/forecast?latitude=${registryData.farmLat}` +
         `&longitude=${registryData.farmLon}` +
-        `&hourly=precipitation_probability,precipitation&forecast_days=1&timezone=auto`;
+        `&hourly=precipitation_probability,precipitation` +
+        `&forecast_days=2&timezone=auto&timeformat=unixtime`;
       const res = await fetch(url);
       const json = await res.json();
 
-      const times = json?.hourly?.time ?? [];
-      const probs = json?.hourly?.precipitation_probability ?? [];
-      const precs = json?.hourly?.precipitation ?? [];
-      const nowMs = Date.now();
+      rainForecast = evaluateRainForecast({
+        times: json?.hourly?.time ?? [],
+        probs: json?.hourly?.precipitation_probability ?? [],
+        precs: json?.hourly?.precipitation ?? [],
+        nowMs,
+      });
 
-      let maxProb = 0;
-      let totalPrecip = 0;
-      let hoursChecked = 0;
-      for (
-        let i = 0;
-        i < times.length && hoursChecked < RAIN_LOOKAHEAD_HOURS;
-        i++
-      ) {
-        const t = new Date(times[i]).getTime();
-        if (t < nowMs) continue; // ข้ามชั่วโมงที่ผ่านไปแล้ว
-        maxProb = Math.max(maxProb, probs[i] ?? 0);
-        totalPrecip += precs[i] ?? 0;
-        hoursChecked++;
-      }
-
-      rainForecast =
-        maxProb >= RAIN_PROBABILITY_THRESHOLD &&
-        totalPrecip >= RAIN_PRECIP_MM_THRESHOLD;
-
-      await db.collection("device_registry").doc(groupId).update({
+      await registryRef.update({
         _weatherCheckedAt: admin.firestore.FieldValue.serverTimestamp(),
         _rainForecast: rainForecast,
       });
@@ -275,31 +259,22 @@ async function computeRainSkip(db, groupId, registryData) {
     }
   }
 
-  if (!rainForecast) {
-    if (registryData._rainSkippedLastCycle === true) {
-      await db
-        .collection("device_registry")
-        .doc(groupId)
-        .update({ _rainSkippedLastCycle: false });
-    }
-    return { skip: false };
-  }
+  const prevStartedAtMs = registryData._rainSkipStartedAt?.toMillis?.() ?? null;
+  const decision = decideRainSkip({
+    rainForecast,
+    skipStartedAtMs: prevStartedAtMs,
+    nowMs,
+  });
 
-  // พยากรณ์บอกว่าฝนจะตก แต่รอบที่แล้วข้ามไปแล้ว รอบนี้รดน้ำตามปกติทันที
-  // ไม่ข้ามซ้อนกันเกิน 1 รอบไม่ว่ากรณีใดก็ตาม
-  if (registryData._rainSkippedLastCycle === true) {
-    await db
-      .collection("device_registry")
-      .doc(groupId)
-      .update({ _rainSkippedLastCycle: false });
-    return { skip: false };
+  if (decision.skipStartedAtMs !== prevStartedAtMs) {
+    await registryRef.update({
+      _rainSkipStartedAt:
+        decision.skipStartedAtMs == null
+          ? admin.firestore.FieldValue.delete()
+          : admin.firestore.Timestamp.fromMillis(decision.skipStartedAtMs),
+    });
   }
-
-  await db
-    .collection("device_registry")
-    .doc(groupId)
-    .update({ _rainSkippedLastCycle: true });
-  return { skip: true };
+  return { skip: decision.skip };
 }
 
 // ฟังก์ชันนี้แทนที่ Cloud Functions ทั้ง 4 ตัวที่เขียนไว้ก่อนหน้า (ซึ่ง deploy
