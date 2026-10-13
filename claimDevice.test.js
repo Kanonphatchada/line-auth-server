@@ -57,7 +57,7 @@ test("ฟาร์มว่าง → ผูก ownerUid และ uid ให้
     uid: "u",
     secret: "s3cret",
   });
-  assert.deepEqual(r.registryUpdate, { ownerUid: "u" });
+  assert.deepEqual(r.registryUpdate, { ownerUid: "u", ...{ memberUids: ["u"], controlUids: ["u"], settingsUids: ["u"] } });
   assert.deepEqual(
     r.nanoUpdates.map((n) => n.id),
     ["Nano1", "Nano2"]
@@ -77,9 +77,15 @@ test("เติมค่าเริ่มต้นเฉพาะฟิลด�
     secret: "s3cret",
   });
   const fresh = r.nanoUpdates.find((n) => n.id === "Fresh").update;
-  assert.deepEqual(fresh, { uid: "u", Moisture: 0, Automois: 20, Valve: false });
+  assert.deepEqual(fresh, {
+    uid: "u",
+    ...{ memberUids: ["u"], controlUids: ["u"], settingsUids: ["u"] },
+    Moisture: 0,
+    Automois: 20,
+    Valve: false,
+  });
   const live = r.nanoUpdates.find((n) => n.id === "Live").update;
-  assert.deepEqual(live, { uid: "u" });
+  assert.deepEqual(live, { uid: "u", ...{ memberUids: ["u"], controlUids: ["u"], settingsUids: ["u"] } });
 });
 
 test("เจ้าของเดิมเพิ่มเซนเซอร์เข้าฟาร์มตัวเอง → ผ่าน เขียนเฉพาะตัวใหม่ ไม่แตะ registry", () => {
@@ -89,7 +95,8 @@ test("เจ้าของเดิมเพิ่มเซนเซอร์�
     uid: "u",
     secret: "s3cret",
   });
-  assert.equal(r.registryUpdate, null);
+  // ไม่เปลี่ยนเจ้าของ แต่ยังเขียนรายชื่อสิทธิ์ (เติมให้ฟาร์มเก่า)
+  assert.deepEqual(r.registryUpdate, { memberUids: ["u"], controlUids: ["u"], settingsUids: ["u"] });
   assert.deepEqual(
     r.nanoUpdates.map((n) => n.id),
     ["Nano4"]
@@ -139,4 +146,20 @@ test("ตัวจำกัดการลอง: ผิดครบกำหน
   lim.recordFailure("u", 5000);
   lim.reset("u");
   assert.equal(lim.isBlocked("u", 5001), false);
+});
+
+test("ฟาร์มที่มีสมาชิกอยู่แล้ว: อุปกรณ์ที่เพิ่งผูกได้รายชื่อสิทธิ์ของสมาชิกด้วย", () => {
+  const r = planClaim({
+    registry: registry({
+      ownerUid: "u",
+      members: { amy: { control: true, settings: false } },
+    }),
+    nanoDocs: [nano("New")],
+    uid: "u",
+    secret: "s3cret",
+  });
+  assert.deepEqual(r.nanoUpdates[0].update.memberUids, ["u", "amy"]);
+  assert.deepEqual(r.nanoUpdates[0].update.controlUids, ["u", "amy"]);
+  assert.deepEqual(r.nanoUpdates[0].update.settingsUids, ["u"]);
+  assert.deepEqual(r.registryUpdate.memberUids, ["u", "amy"]);
 });

@@ -1,4 +1,5 @@
 import { timingSafeEqual } from "node:crypto";
+import { deriveAccessLists } from "./farmMembers.js";
 
 // ตรรกะ "เชื่อมอุปกรณ์เข้าบัญชี" (claim) แยกออกมาเป็นฟังก์ชันล้วนๆ ไม่แตะ
 // Firestore เพื่อให้เทสได้ — index.js เป็นคนอ่านข้อมูล เรียกฟังก์ชันนี้ แล้วเขียน
@@ -40,6 +41,10 @@ export function planClaim({ registry, nanoDocs, uid, secret }) {
     return { error: CLAIM_ERRORS.ALREADY_OWNED };
   }
 
+  // รายชื่อสิทธิ์ของฟาร์ม (เจ้าของ + สมาชิกที่เชิญไว้แล้ว) — อุปกรณ์ที่เพิ่งผูก
+  // ต้องได้รายชื่อนี้ด้วย ไม่งั้นสมาชิกเดิมของฟาร์มจะมองไม่เห็นอุปกรณ์ตัวใหม่
+  const access = deriveAccessLists(owner ?? uid, registry.members);
+
   const nanoUpdates = [];
   const skipped = [];
   for (const { id, data } of nanoDocs) {
@@ -51,7 +56,7 @@ export function planClaim({ registry, nanoDocs, uid, secret }) {
       continue;
     }
     // เติมเฉพาะฟิลด์ที่ "ยังไม่มี" กันทับค่าจริงจากฮาร์ดแวร์ (เหมือนที่แอปเคยทำ)
-    const update = { uid };
+    const update = { uid, ...access };
     if (!("Moisture" in data)) update.Moisture = 0;
     if (!("Automois" in data)) update.Automois = 20;
     if (!("Valve" in data)) update.Valve = false;
@@ -59,7 +64,8 @@ export function planClaim({ registry, nanoDocs, uid, secret }) {
   }
 
   return {
-    registryUpdate: owner === null ? { ownerUid: uid } : null,
+    // เขียนรายชื่อสิทธิ์ลงฟาร์มทุกครั้ง (เติมให้ฟาร์มที่มีก่อนมีระบบสมาชิกด้วย)
+    registryUpdate: owner === null ? { ownerUid: uid, ...access } : access,
     nanoUpdates,
     skipped,
   };
