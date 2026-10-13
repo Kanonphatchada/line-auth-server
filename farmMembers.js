@@ -6,9 +6,13 @@ import { randomInt } from "node:crypto";
 //
 // โมเดลข้อมูล:
 //   device_registry/{farmId}.members = { [uid]: { control, settings, name, joinedAt } }
-//   สิทธิ์ "ดู" มีเสมอสำหรับทุกคนที่อยู่ในฟาร์ม ส่วนสิทธิ์อื่นเจ้าของตั้งรายคน:
+//   สิทธิ์ "ดู" มีเสมอสำหรับทุกคนที่อยู่ในฟาร์ม ส่วนสิทธิ์อื่นเจ้าของตั้งรายคน เป็น
+//   3 ระดับ: ดูอย่างเดียว → ควบคุมได้ → จัดการได้
 //     control  = สั่งวาล์ว / เปิด-ปิด Auto / ตั้งความชื้นเป้าหมาย (Automois)
 //     settings = ตั้งตารางเวลา / ข้ามฝน / ตำแหน่งฟาร์ม
+//   settings ต้องมาคู่กับ control เสมอ (normalizePermissions บังคับให้) เพราะการ
+//   บันทึกตารางเวลาในแอปเขียนทั้งฟิลด์ตารางเวลาและ Auto/Valve พร้อมกัน ถ้ามี
+//   settings โดยไม่มี control จะบันทึกไม่ได้เลย (กฎปฏิเสธเงียบๆ)
 //   เจ้าของ (ownerUid) ได้ทุกสิทธิ์เสมอ และเป็นคนเดียวที่เชิญ/ลบสมาชิกได้
 //   เพื่อให้ Firestore rules เช็คสิทธิ์ได้โดยไม่ต้องอ่านเอกสารอื่น (และให้แอปค้น
 //   "อุปกรณ์ของฉัน" ได้) เก็บรายชื่อ uid แบบ denormalize ไว้ทั้งบนฟาร์มและบน
@@ -37,6 +41,12 @@ export const MEMBER_ERRORS = {
   },
   BAD_REQUEST: { status: 400, message: "ข้อมูลไม่ครบหรือไม่ถูกต้อง" },
 };
+
+// settings (ตั้งค่า) บังคับให้ได้ control (ควบคุม) ด้วยเสมอ — ค่าที่ไม่ใช่ true เป็น false
+export function normalizePermissions({ control, settings }) {
+  const manage = settings === true;
+  return { control: control === true || manage, settings: manage };
+}
 
 export function generateInviteCode(rand = randomInt) {
   let code = "";
@@ -102,8 +112,7 @@ export function planInvite({ registry, uid, control, settings, now }) {
   if (ownerOf(registry) !== uid) return { error: MEMBER_ERRORS.NOT_OWNER };
   return {
     invite: {
-      control: control === true,
-      settings: settings === true,
+      ...normalizePermissions({ control, settings }),
       createdBy: uid,
       createdAt: now,
       expiresAt: now + INVITE_TTL_MS,
@@ -127,8 +136,7 @@ export function planJoin({ registry, invite, uid, displayName, now }) {
     return { error: MEMBER_ERRORS.MEMBER_LIMIT };
   }
   members[uid] = {
-    control: invite.control === true,
-    settings: invite.settings === true,
+    ...normalizePermissions(invite),
     name: typeof displayName === "string" ? displayName.slice(0, 60) : "",
     joinedAt: now,
   };
@@ -145,8 +153,7 @@ export function planUpdateMember({ registry, uid, memberUid, control, settings }
   }
   members[memberUid] = {
     ...members[memberUid],
-    control: control === true,
-    settings: settings === true,
+    ...normalizePermissions({ control, settings }),
   };
   return { registryUpdate: withAccess(registry, members) };
 }

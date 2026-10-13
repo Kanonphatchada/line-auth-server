@@ -9,6 +9,7 @@ import {
   deriveAccessLists,
   generateInviteCode,
   normalizeInviteCode,
+  normalizePermissions,
   planInvite,
   planJoin,
   planLeave,
@@ -325,4 +326,47 @@ test("ฟังก์ชันวางแผนไม่แก้ object regist
   });
   planJoin({ registry, invite: invite(), uid: "zed", now: NOW });
   assert.equal(JSON.stringify(registry), snapshot);
+});
+
+test("3 ระดับสิทธิ์: ตั้งค่า (settings) บังคับให้ได้ควบคุม (control) ด้วยเสมอ", () => {
+  assert.deepEqual(normalizePermissions({}), { control: false, settings: false });
+  assert.deepEqual(normalizePermissions({ control: true }), {
+    control: true,
+    settings: false,
+  });
+  assert.deepEqual(normalizePermissions({ settings: true }), {
+    control: true,
+    settings: true,
+  });
+  assert.deepEqual(normalizePermissions({ control: "yes", settings: 1 }), {
+    control: false,
+    settings: false,
+  });
+});
+
+test("เชิญ/ปรับสิทธิ์/เข้าร่วม ด้วย settings อย่างเดียว → ได้ control ด้วยทุกเส้นทาง", () => {
+  const inv = planInvite({
+    registry: farm(),
+    uid: "owner",
+    settings: true,
+    now: NOW,
+  });
+  assert.equal(inv.invite.control, true);
+
+  const joined = planJoin({
+    registry: farm(),
+    invite: invite({ settings: true, control: false }),
+    uid: "bob",
+    now: NOW,
+  });
+  assert.deepEqual(joined.registryUpdate.controlUids, ["owner", "bob"]);
+
+  const upd = planUpdateMember({
+    registry: withBob(),
+    uid: "owner",
+    memberUid: "bob",
+    control: false,
+    settings: true,
+  });
+  assert.equal(upd.registryUpdate.members.bob.control, true);
 });
