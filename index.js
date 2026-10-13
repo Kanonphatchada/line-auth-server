@@ -6,6 +6,7 @@ import admin from "firebase-admin";
 import dotenv from "dotenv";
 import { checkDevices } from "./checkDevices.js";
 import { planClaim, createAttemptLimiter, CLAIM_ERRORS } from "./claimDevice.js";
+import { registerFarmMemberRoutes } from "./farmMembersRoutes.js";
 
 dotenv.config();
 
@@ -190,6 +191,9 @@ app.get("/cron/check-devices", async (req, res) => {
    ตรรกะตัดสินอยู่ใน claimDevice.js (แยกไว้เพื่อเทส)
 ===================================================== */
 const claimLimiter = createAttemptLimiter();
+
+// ระบบสมาชิกของฟาร์ม: เชิญ / เข้าร่วม / ปรับสิทธิ์ / ลบ / ออก (ดู farmMembersRoutes.js)
+registerFarmMemberRoutes({ app, admin });
 
 app.post("/claim-device", async (req, res) => {
   const authHeader = req.headers.authorization || "";

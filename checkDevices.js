@@ -1,5 +1,6 @@
 import admin from "firebase-admin";
 import fetch from "node-fetch";
+import { accessForRegistry, sameAccessLists } from "./farmMembers.js";
 import { evaluateRainForecast, decideRainSkip } from "./rainDecision.js";
 
 // ไม่เรียก admin.initializeApp() ในไฟล์นี้ — ฟังก์ชันนี้ถูก import เข้าไปใช้
@@ -295,6 +296,20 @@ export async function checkDevices() {
   const registryByGroupId = new Map();
   registrySnapshot.docs.forEach((d) => registryByGroupId.set(d.id, d.data()));
 
+  // ซิงก์รายชื่อสิทธิ์สมาชิก (memberUids/controlUids/settingsUids) ของฟาร์มที่มี
+  // เจ้าของ ให้ตรงกับ ownerUid + members เสมอ — ทำหน้าที่ย้ายข้อมูลฟาร์มที่มีก่อน
+  // ระบบสมาชิก (ไม่มีฟิลด์พวกนี้) และซ่อมถ้าครั้งก่อนเขียนไม่ครบ เขียนเฉพาะเมื่อ
+  // ค่าต่างจากที่ควรเป็นเท่านั้น
+  let accessSynced = 0;
+  for (const [farmId, reg] of registryByGroupId) {
+    if (!reg.ownerUid) continue;
+    const access = accessForRegistry(reg);
+    if (sameAccessLists(reg, access)) continue;
+    await db.collection("device_registry").doc(farmId).update(access);
+    Object.assign(reg, access);
+    accessSynced++;
+  }
+
   // เช็คพยากรณ์ฝนครั้งเดียวต่อกลุ่ม/ฟาร์ม (ไม่ใช่ต่ออุปกรณ์) แล้ว cache
   // (แคช, พักผลไว้ใช้ซ้ำ) ผลไว้ใช้กับทุกอุปกรณ์ในฟาร์มเดียวกันด้านล่าง
   const groupRainSkipByGroupId = new Map();
@@ -321,9 +336,12 @@ export async function checkDevices() {
         .collection("device_registry")
         .doc(data.groupId)
         .get();
-      const ownerUid = registryDoc.exists ? registryDoc.data().ownerUid : null;
+      const registryData = registryDoc.exists ? registryDoc.data() : null;
+      const ownerUid = registryData ? registryData.ownerUid : null;
       if (ownerUid) {
         updates.uid = ownerUid;
+        // พร้อมรายชื่อสิทธิ์ของฟาร์ม (สมาชิกที่เชิญไว้จะได้เห็นอุปกรณ์ใหม่ด้วย)
+        Object.assign(updates, accessForRegistry(registryData));
         assigned++;
       }
     }
@@ -336,6 +354,15 @@ export async function checkDevices() {
     const groupRegistry = data.groupId
       ? registryByGroupId.get(data.groupId)
       : null;
+
+    // อุปกรณ์ในฟาร์มที่มีเจ้าของ ต้องมีรายชื่อสิทธิ์ตรงกับฟาร์ม
+    if (groupRegistry?.ownerUid) {
+      const farmAccess = accessForRegistry(groupRegistry);
+      if (!sameAccessLists(data, farmAccess)) {
+        Object.assign(updates, farmAccess);
+        accessSynced++;
+      }
+    }
     const scheduleSource = resolveScheduleSource(data, groupRegistry);
     let effectiveAuto = computeEffectiveAuto(data, groupRegistry);
 
@@ -604,6 +631,7 @@ export async function checkDevices() {
   const summary = {
     scanned: snapshot.size,
     assigned,
+    accessSynced,
     offlineFlagged,
     onlineCleared,
     faultsFlagged,
