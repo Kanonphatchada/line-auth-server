@@ -2,6 +2,7 @@ import admin from "firebase-admin";
 import fetch from "node-fetch";
 import { accessForRegistry, sameAccessLists } from "./farmMembers.js";
 import { evaluateRainForecast, decideRainSkip } from "./rainDecision.js";
+import { classifyActivity } from "./deviceActivity.js";
 
 // ไม่เรียก admin.initializeApp() ในไฟล์นี้ — ฟังก์ชันนี้ถูก import เข้าไปใช้
 // ใน index.js ซึ่ง initialize แอปไว้แล้วตั้งแต่ตอนเริ่มเซิร์ฟเวอร์
@@ -87,9 +88,8 @@ async function closeIncident(doc, incidentId) {
     .catch((err) => console.error("❌ closeIncident error:", err));
 }
 
-// อุปกรณ์ควรรายงานค่าเข้ามาสม่ำเสมอ (ทุก 5 นาทีตามสเปกจริง) ถ้าเงียบไปนาน
-// ผิดปกติ น่าจะพัง/หลุดการเชื่อมต่อ
-const OFFLINE_THRESHOLD_MS = 30 * 60 * 1000; // 30 นาที
+// เกณฑ์ขาดการติดต่อ (30 นาที) และ "ไม่ได้ใช้งาน" (ไม่เคยส่ง/เงียบเกิน 7 วัน)
+// อยู่ใน deviceActivity.js
 
 // เซ็นเซอร์ RS485 รายงานเป็น % ความชื้น มาตรฐานเดียวกันทุกตัว ความคลาดเคลื่อน
 // ของตัวเซ็นเซอร์เองอยู่ที่ ~±2-3% ตามสเปก เลยตั้งพื้นที่ให้ถือว่า "ค่านิ่ง"
@@ -323,6 +323,7 @@ export async function checkDevices() {
   let assigned = 0;
   let offlineFlagged = 0;
   let onlineCleared = 0;
+  let dormantCleared = 0;
   let faultsFlagged = 0;
   let faultsCleared = 0;
 
@@ -402,11 +403,30 @@ export async function checkDevices() {
 
     const lastSeenMs = Math.max(lastSeenFieldMs ?? 0, lastLogMs ?? 0) || null;
 
-    const isStale =
-      lastSeenMs === null ||
-      now.toMillis() - lastSeenMs > OFFLINE_THRESHOLD_MS;
+    // active = ปกติ / offline = เงียบเกิน 30 นาที / dormant = ไม่เคยส่งข้อมูล
+    // หรือเงียบเกิน 7 วัน (เช่น อุปกรณ์ที่สร้างไว้ทดสอบ ไม่มีเครื่องจริง)
+    const activity = classifyActivity(lastSeenMs, now.toMillis());
+    const isDormant = activity === "dormant";
+    const isStale = activity === "offline";
 
-    if (isStale && data.offline !== true) {
+    if (isDormant) {
+      // ไม่นับเป็น "ขาดการติดต่อ" ไม่เตือน และไม่เปิด incident ใหม่ — ถ้าเคย
+      // ถูกติดป้าย offline ไว้ก่อนหน้า เคลียร์ทิ้งแบบเงียบๆ (ไม่ส่ง LINE
+      // "กลับมาเชื่อมต่อ" เพราะไม่ได้กลับมาจริง)
+      if (data.offline === true) {
+        updates.offline = false;
+        updates.openOfflineIncidentId = admin.firestore.FieldValue.delete();
+        await closeIncident(doc, data.openOfflineIncidentId);
+        dormantCleared++;
+      }
+      if (data.dormant !== true) updates.dormant = true;
+    } else if (data.dormant === true) {
+      updates.dormant = admin.firestore.FieldValue.delete();
+    }
+
+    if (isDormant) {
+      // ข้าม: จัดการด้านบนแล้ว
+    } else if (isStale && data.offline !== true) {
       updates.offline = true;
       offlineFlagged++;
       updates.openOfflineIncidentId = await openIncident(
@@ -460,7 +480,7 @@ export async function checkDevices() {
       valveChangedAtMs > 0 &&
       now.toMillis() - valveChangedAtMs >= VALVE_STABLE_MS;
 
-    if (isStale) {
+    if (isStale || isDormant) {
       // ขาดการติดต่ออยู่แล้ว ไม่ต้องซ้ำเรื่องอื่น เคลียร์ป้ายทิ้งไปก่อน (ปิด
       // incident เงียบๆ ไม่ถือว่า "หายแล้ว" จริง เลยไม่ส่ง LINE)
       if (effectiveFaultType) {
@@ -634,6 +654,7 @@ export async function checkDevices() {
     accessSynced,
     offlineFlagged,
     onlineCleared,
+    dormantCleared,
     faultsFlagged,
     faultsCleared,
   };
