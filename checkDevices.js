@@ -231,13 +231,21 @@ async function computeRainSkip(db, groupId, registryData) {
 
   const checkedAtMs = registryData._weatherCheckedAt?.toMillis?.() ?? 0;
   let rainForecast = registryData._rainForecast === true;
+  let forecastStats = {
+    maxProb: registryData._rainMaxProb ?? null,
+    totalPrecip: registryData._rainTotalPrecip ?? null,
+  };
 
   if (Date.now() - checkedAtMs > WEATHER_CACHE_MS) {
     try {
       const url =
         `https://api.open-meteo.com/v1/forecast?latitude=${registryData.farmLat}` +
         `&longitude=${registryData.farmLon}` +
-        `&hourly=precipitation_probability,precipitation&forecast_days=1&timezone=auto`;
+        `&hourly=precipitation_probability,precipitation&forecast_days=2` +
+        // unixtime = วินาทีสากล ไม่ขึ้นกับเขตเวลา (timezone=auto ส่งเวลาท้องถิ่น
+        // แบบไม่มี offset แล้ว new Date() บน Render ตีเป็น UTC เพี้ยนไป 7 ชม.)
+        // ขอ 2 วันกันใกล้เที่ยงคืนแล้วไม่มีชั่วโมงถัดไปให้เช็ค
+        `&timeformat=unixtime`;
       const res = await fetch(url);
       const json = await res.json();
 
@@ -254,7 +262,7 @@ async function computeRainSkip(db, groupId, registryData) {
         i < times.length && hoursChecked < RAIN_LOOKAHEAD_HOURS;
         i++
       ) {
-        const t = new Date(times[i]).getTime();
+        const t = times[i] * 1000;
         if (t < nowMs) continue; // ข้ามชั่วโมงที่ผ่านไปแล้ว
         maxProb = Math.max(maxProb, probs[i] ?? 0);
         totalPrecip += precs[i] ?? 0;
@@ -264,10 +272,13 @@ async function computeRainSkip(db, groupId, registryData) {
       rainForecast =
         maxProb >= RAIN_PROBABILITY_THRESHOLD &&
         totalPrecip >= RAIN_PRECIP_MM_THRESHOLD;
+      forecastStats = { maxProb, totalPrecip };
 
       await db.collection("device_registry").doc(groupId).update({
         _weatherCheckedAt: admin.firestore.FieldValue.serverTimestamp(),
         _rainForecast: rainForecast,
+        _rainMaxProb: maxProb,
+        _rainTotalPrecip: totalPrecip,
       });
     } catch (err) {
       console.error(`❌ weather fetch failed for group ${groupId}:`, err);
@@ -299,7 +310,7 @@ async function computeRainSkip(db, groupId, registryData) {
     .collection("device_registry")
     .doc(groupId)
     .update({ _rainSkippedLastCycle: true });
-  return { skip: true };
+  return { skip: true, ...forecastStats };
 }
 
 // ฟังก์ชันนี้แทนที่ Cloud Functions ทั้ง 4 ตัวที่เขียนไว้ก่อนหน้า (ซึ่ง deploy
@@ -373,6 +384,18 @@ export async function checkDevices() {
     const skippedForRain = rainSkip?.skip === true && effectiveAuto === true;
     if (skippedForRain) {
       effectiveAuto = false;
+      // บันทึกประวัติการข้าม (ปิดทันที ไม่ใช่ปัญหาค้าง) — ไม่ส่ง LINE
+      await doc.ref
+        .collection("Incidents")
+        .add({
+          type: "rain_skip",
+          cause: `ข้ามรดน้ำเพราะพยากรณ์ฝน (โอกาส ${rainSkip.maxProb}%, ปริมาณ ${Number(rainSkip.totalPrecip).toFixed(1)} มม. ใน ${RAIN_LOOKAHEAD_HOURS} ชม.ข้างหน้า)`,
+          maxProb: rainSkip.maxProb,
+          totalPrecip: rainSkip.totalPrecip,
+          startedAt: admin.firestore.FieldValue.serverTimestamp(),
+          resolvedAt: admin.firestore.FieldValue.serverTimestamp(),
+        })
+        .catch((err) => console.error("❌ rain_skip log error:", err));
     }
 
     if (
